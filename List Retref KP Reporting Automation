@@ -1,0 +1,134 @@
+import pandas as pd
+import numpy as np
+import sys
+import os
+import json
+from datetime import date, datetime, timedelta
+from io import BytesIO
+import traceback
+from importlib.machinery import SourceFileLoader
+from dateutil.relativedelta import relativedelta
+import platform
+import openpyxl
+
+sys.path.append(os.path.dirname(os.path.abspath(os.path.join(__file__,'../../')))+'/email')
+sys.path.append(os.path.dirname(os.path.abspath(os.path.join(__file__,'../../')))+'/secrets')
+sys.path.append(os.path.dirname(os.path.abspath(os.path.join(__file__,'../../')))+'/datalake')
+
+import ec2secret as secrets
+import send_email as send_email
+import athena_query as athena_query
+import send_email_recipient_mod as send_email_recipient_mod
+
+ec2_secret = json.loads(secrets.get_secret())
+username = ec2_secret['user_db']
+password = ec2_secret['pass_db']
+
+if(platform.system() == 'Windows'):
+    utility_module = SourceFileLoader('function_helper', 'D:/Gitlab/function_helper.py').load_module()
+elif(platform.system() == 'Darwin'):
+    utility_module = SourceFileLoader('function_helper', '/Users/168349.joshua/GitLab/function_helper/function_helper.py').load_module()
+else:
+    utility_module = SourceFileLoader("function_helper","/var/ruparupa/function_helper/function_helper.py").load_module()   
+
+try:
+    QueryString = """
+        SELECT 
+            c.invoice_no AS "No. Invoice",
+            c.order_no AS "No. Order",
+            c.return_no,
+            c.status,
+            ci.sku,
+            si.receipt_id as receipt_no,
+            srrid.weight,
+            srrid.packaging_length,
+            srrid.packaging_width,
+            srrid.packaging_height,
+            c.created_at
+        FROM
+            ruparupadb_2.sales_return_tugu c
+            LEFT JOIN ruparupadb_2.sales_return_refund_item ci 
+                ON c.return_no = ci.refund_no
+            LEFT JOIN ruparupadb_2.sales_return_refund_item_dimension srrid 
+                ON srrid.refund_no = ci.refund_no
+            LEFT JOIN ruparupadb_2.sales_invoice si 
+                ON si.invoice_no = c.invoice_no 
+            left join ruparupadb_2.sales_order_item_flat soif
+                on soif.sales_order_item_id = ci.sales_order_item_id
+        WHERE c.return_no LIKE '%KP%'
+            AND date_parse(c.created_at, '%Y-%m-%d %H:%i:%s') >= date_trunc('month', date_add('month', -1, current_date))  
+            AND date_parse(c.created_at, '%Y-%m-%d %H:%i:%s') < date_trunc('month', current_date)  
+            and c.status = 'received'
+            and c.method_type = 'delivery'
+            and soif.sales_source in ('RR MApps','RR Webs')
+        """
+    QueryString_run = athena_query.querying(QueryString, delay=10, maxAttempt=10)
+
+    df_QueryString = QueryString_run.copy()
+
+    if(len(df_QueryString) > 0): 
+        
+        file_name = 'list retref KP ' + (datetime.now() - relativedelta(months=1)).strftime("%B %Y") + '.xlsx'
+
+        file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'data', file_name)
+
+        df_QueryString.to_excel(file_path, index=False)
+        
+        SENDER = 'Data Team RR <notif-noreply@ruparupa.io>'
+
+        RECIPIENT = 'yuliana.fitri@ruparupa.com'
+        CC = ['angella.tan@ruparupa.com','seruni.lumongga@ruparupa.com','indah.lestari@ruparupa.com','leonard.william@ruparupa.com','timotius.rosevalt@ruparupa.com','joshua@ruparupa.com']
+        BCC = []
+        
+        previous_month_year = (datetime.now() - relativedelta(months=1)).strftime("%B %Y")
+
+        message = f"""Dear OPS Team,\n\n I hope this email finds you well.\n\n Attached to this email is a .xlsx file containing the list of return refund KP last month.\n\n This report is for the month of {previous_month_year}.\n\n Should you have any further questions or need additional assistance regarding this data, please feel free to reach out to us.\n\n Thank you for your cooperation and attention."""    
+        SUBJECT = f"List data KP - {previous_month_year}"
+
+        BODY_TEXT = message
+
+        BODY_HTML = """\
+        <html>
+        <head></head>
+        <body>
+        <p>"""+message.replace('\n', '<br>')+"""</p></br>
+        </body>
+        </html>
+        """
+
+        send_email_recipient_mod.send_email(SENDER,RECIPIENT,CC,BCC,SUBJECT,BODY_TEXT,BODY_HTML, df_QueryString,file_name)
+        
+        os.remove(os.path.dirname(os.path.realpath(__file__)) + '/data/list retref KP ' + (datetime.now() - relativedelta(months=1)).strftime("%B %Y") + '.xlsx')
+except Exception as e:
+    # Get Info
+    error_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    error_message = str(e)
+    script_path = os.path.abspath(sys.argv[0])
+    exc_type, exc_value, exc_tb = sys.exc_info()
+    line_number = exc_tb.tb_lineno
+    full_traceback = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+
+    # Compact error summary
+    BODY_TEXT = (
+        "We have an issue, please check the details below\n\n"
+        f"🕒 Error Time: {error_time}\n"
+        f"📂 Script: {script_path}\n"
+        f"💬 Error Message: {error_message}\n"
+        f"📍 Line: {line_number}\n\n"
+        f"📄 {full_traceback}"
+    )[:1900] # get 1900 character, discord limit is 2000
+
+    # Email subject and body in HTML
+    SUBJECT = '🚨 Script Failed: miss_ace_sudah_aktivasi_belum_gabung_rrr'
+    BODY_HTML = f"""
+    <html>
+    <body>
+        <h3>Error Report</h3>
+        <p>"""+BODY_TEXT+"""</p></br>
+        <p>Thank you.</p>
+    </body>
+    </html>
+    """
+
+    print(BODY_TEXT)
+    send_email.send_email(None, None, SUBJECT, BODY_TEXT, BODY_HTML)
