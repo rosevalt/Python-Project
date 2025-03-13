@@ -1,0 +1,162 @@
+from io import StringIO
+from importlib.machinery import SourceFileLoader
+import platform
+import os
+import pandas as pd
+import json 
+from datetime import date, datetime, timedelta
+import sys 
+import traceback
+import requests
+import ast
+import math
+import time
+
+#IMPORT MODULE 
+if(platform.system() == 'Windows'):
+    utility_module = SourceFileLoader('function_helper', 'D:/Gitlab/function_helper.py').load_module()
+elif(platform.system() == 'Darwin'):
+    utility_module = SourceFileLoader("function_helper","/Users/161941.dariswan/var/ruparupa/function_helper/function_helper.py").load_module()
+else:
+    utility_module = SourceFileLoader("function_helper","/var/ruparupa/function_helper/function_helper.py").load_module()  
+
+def send_data_to_vue(data, order_id):
+   
+        api_url = "https://apse1.vue.ai/api/v1/events/track"  
+        headers = {
+        'Content-Type': 'application/json',
+        'x-api-key': 'b0a9b1436f4740b78479b2e45ef253a3',  
+        'X-CORRELATION-ID': order_id 
+        }
+        try:
+            response = requests.post(api_url, headers=headers, json=data)
+            response.raise_for_status()  # Will raise an error if the response status code is not 2xx
+            print("Response JSON:", response.json())
+        except requests.exceptions.HTTPError as http_err:
+            print(f"HTTP error occurred for order {order_id}: {http_err}")
+            time.sleep(2)
+        except requests.exceptions.RequestException as req_err:
+            print(f"Request error occurred for order {order_id}: {req_err}")
+            time.sleep(2)
+
+try:
+    
+    #QUERY DATA FROM DATALAKE
+    QueryString = """
+                SELECT DISTINCT
+                    'offline_user' AS blox_uuid, 
+                    (select csm.customer_id from ruparupadb_2.customer_stamps_memberships csm where csm.user_id = kltr.user_id)as user_id,
+                    (SELECT array_agg(sbd.item)
+                    FROM kawanlamadb_all.sales_basic_data sbd 
+                    WHERE kltr.invoice_number = sbd.orderid ) AS viewed_prodid,
+                    'non_applicable' AS referrer,
+                    'non_applicable' AS url,
+                    (SELECT CASE
+                        WHEN sp.supplier_alias = 'AHI' THEN 'ace'
+                        WHEN sp.supplier_alias = 'TGI' THEN 'toyskingdom'
+                        WHEN sp.supplier_alias = 'Selma' THEN 'selma'
+                        WHEN sp.supplier_alias = 'HCI' THEN 'informa'
+                    END
+                    FROM ruparupadb_2.store st left join ruparupadb_2.supplier sp on st.supplier_id = sp.supplier_id
+                    where st.store_code = kltr.store_name
+                    ) AS store,
+                    (SELECT array_agg(sbd.qty)
+                    FROM kawanlamadb_all.sales_basic_data sbd 
+                    WHERE kltr.invoice_number = sbd.orderid ) AS quantity,
+                    kltr.invoice_number AS order_id,
+                    'offline_purchase' AS platform,
+                    'IDR' AS currency,
+                    (SELECT array_agg(sbd.c_sales_amount)
+                         FROM kawanlamadb_all.sales_basic_data sbd 
+                         WHERE kltr.invoice_number = sbd.orderid) AS product_price,
+                    'oc' AS page_type,
+                    'Order Confirmation page' AS page_name,
+                    'orderConfirmation' AS event_name,
+                    'vuex' AS medium,
+                    'msd' AS source,
+                    'prod' AS env
+                FROM
+                    kawanlamadb_all.transactionreport kltr
+                where 
+                kltr.channel = 'POS'
+                and CAST(kltr.date AS DATE) = date_add('day', -1, current_date)
+                and (select csm.customer_id from ruparupadb_2.customer_stamps_memberships csm where csm.user_id = kltr.user_id) is not null    
+                and (SELECT array_agg(sbd.item)
+                    FROM kawanlamadb_all.sales_basic_data sbd 
+                    WHERE kltr.invoice_number = sbd.orderid ) is not null
+            """
+
+    result_df = utility_module.query_athena(QueryString)
+    
+    result_json = result_df.to_dict(orient="records")
+
+    for item in result_json:   
+        print(item['order_id'])
+        if isinstance(item['viewed_prodid'], str):
+            cleaned_str = item['viewed_prodid'].strip("[]")
+            item['viewed_prodid'] = [prodid.strip() for prodid in cleaned_str.split(",")]
+        
+        if isinstance(item['quantity'], str):
+            item['quantity'] = eval(item['quantity'])  
+        
+        if isinstance(item['quantity'], list):
+            item['quantity'] = [int(qty) for qty in item['quantity']] 
+
+        if isinstance(item['product_price'], str):
+            item['product_price'] = eval(item['product_price'])  
+
+        if isinstance(item['product_price'], list):
+            item['product_price'] = [
+            str(price) if isinstance(price, (int, float)) and math.isfinite(float(price)) else "0"
+            for price in item['product_price']
+            ]
+
+        if isinstance(item['user_id'], (int)): 
+            item['user_id'] = str(item['user_id'])
+        
+        # Sent Order Confirmation 
+        item['page_name'] = 'Order Confirmation page'
+        item['event_name'] ='orderConfirmation'
+
+        send_data_to_vue(item,str(item['order_id']))
+
+        # Sent Payment Confirmation 
+        item['page_name'] = 'Payment Confirmation page'
+        item['event_name'] ='paymentConfirmation'
+        
+        send_data_to_vue(item,str(item['order_id']))
+        
+
+except Exception as e:
+    # Get Info
+    error_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    error_message = str(e)
+    script_path = os.path.abspath(sys.argv[0])
+    exc_type, exc_value, exc_tb = sys.exc_info()
+    line_number = exc_tb.tb_lineno
+    full_traceback = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+
+    # Compact error summary
+    BODY_TEXT = (
+        "We have an issue, please check the details below\n\n"
+        f"🕒 Error Time: {error_time}\n"
+        f"📂 Script: {script_path}\n"
+        f"💬 Error Message: {error_message}\n"
+        f"📍 Line: {line_number}\n\n"
+        f"📄 {full_traceback}"
+    )[:1900] # get 1900 character, discord limit is 2000
+
+    # Email subject and body in HTML
+    SUBJECT = '🚨 Script Failed: Sent Offline Transaction to VUE.AI'
+    BODY_HTML = f"""
+    <html>
+    <body>
+        <h3>Error Report</h3>
+        <p>"""+BODY_TEXT+"""</p></br>
+        <p>Thank you.</p>
+    </body>
+    </html>
+    """
+
+    print(BODY_TEXT)
+    utility_module.send_email_error('daris.ruparupa@gmail.com', 'Timo', SUBJECT, BODY_TEXT)
